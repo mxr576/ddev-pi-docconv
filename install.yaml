@@ -1,6 +1,11 @@
 name: pi-docconv
 
-project_files:
-  - docker-compose.pi-docconv.yaml
+dependencies:
+  - mxr576/ddev-pi
 
-ddev_version_constraint: '>= v1.24.10'
+project_files:
+  - commands/host/docconv
+  - docker-compose.pi-docconv.yaml
+  - pi/
+
+ddev_version_constraint: '>= v1.25.5'

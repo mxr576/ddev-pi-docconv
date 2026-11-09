@@ -40,17 +40,86 @@ setup() {
 }
 
 health_checks() {
-  # Do something useful here that verifies the add-on
-
-  # You can check for specific information in headers:
-  # run curl -sfI https://${PROJNAME}.ddev.site
-  # assert_output --partial "HTTP/2 200"
-  # assert_output --partial "test_header"
-
-  # Or check if some command gives expected output:
-  DDEV_DEBUG=true run ddev launch
+  # Start the pi container profile
+  echo "# Starting pi container profile..." >&3
+  run ddev start --profiles=pi
   assert_success
-  assert_output --partial "FULLURL https://${PROJNAME}.ddev.site"
+
+  # Verify PI_DOCCONV_VERSION defaults to "main" inside the pi container
+  echo "# Checking if PI_DOCCONV_VERSION defaults to main inside the pi container..." >&3
+  run ddev exec -s pi printenv PI_DOCCONV_VERSION
+  assert_success
+  assert_output "main"
+
+  # Verify we can override PI_DOCCONV_VERSION via .ddev/.env.pi
+  echo "# Testing override of PI_DOCCONV_VERSION via .ddev/.env.pi..." >&3
+  echo 'PI_DOCCONV_VERSION="custom-override"' >> .ddev/.env.pi
+  run ddev restart
+  assert_success
+  run ddev start --profiles=pi
+  assert_success
+  run ddev exec -s pi printenv PI_DOCCONV_VERSION
+  assert_success
+  assert_output "custom-override"
+
+  # Verify pandoc is installed in the container
+  echo "# Verifying pandoc in container..." >&3
+  run ddev exec -s pi which pandoc
+  assert_success
+
+  # Verify libreoffice is installed in the container
+  echo "# Verifying libreoffice in container..." >&3
+  run ddev exec -s pi which libreoffice
+  assert_success
+
+  # Verify poppler-utils (pdfinfo and pdftoppm) in container
+  echo "# Verifying poppler-utils in container..." >&3
+  run ddev exec -s pi which pdfinfo
+  assert_success
+  run ddev exec -s pi which pdftoppm
+  assert_success
+
+  # Verify docconv is executable inside the container
+  echo "# Verifying docconv binary in container..." >&3
+  run ddev exec -s pi which docconv
+  assert_success
+
+  # Verify ddev docconv --help via host command
+  echo "# Testing ddev docconv --help..." >&3
+  run ddev docconv --help
+  assert_success
+  assert_output --partial "convert"
+  assert_output --partial "verify"
+
+  # Copy test fixture into project root
+  cp "${DIR}/tests/testdata/fixture-1page.md" "${TESTDIR}/fixture-1page.md"
+
+  # Test ddev docconv convert with --to docx,pdf,png --json
+  echo "# Testing ddev docconv convert with --to docx,pdf,png --json..." >&3
+  run ddev docconv convert fixture-1page.md --to docx,pdf,png --json
+  assert_success
+  assert_output --partial '"status": "success"'
+  assert_output --partial '"pages": 1'
+  assert_output --partial 'fixture-1page.docx'
+  assert_output --partial 'fixture-1page.pdf'
+  assert_output --partial 'fixture-1page-page-1.png'
+  assert_file_exist "${TESTDIR}/fixture-1page.docx"
+  assert_file_exist "${TESTDIR}/fixture-1page.pdf"
+  assert_file_exist "${TESTDIR}/fixture-1page-page-1.png"
+
+  # Test ddev docconv verify with --exact-pages 1 (should succeed)
+  echo "# Testing ddev docconv verify with --exact-pages 1..." >&3
+  run ddev docconv verify fixture-1page.md --exact-pages 1 --json
+  assert_success
+  assert_output --partial '"status": "success"'
+  assert_output --partial '"pages": 1'
+
+  # Test ddev docconv verify with --exact-pages 2 (should fail)
+  echo "# Testing ddev docconv verify with --exact-pages 2..." >&3
+  run ddev docconv verify fixture-1page.md --exact-pages 2 --json
+  assert_failure
+  assert_output --partial '"status": "failed"'
+  assert_output --partial "expected exactly 2"
 }
 
 teardown() {

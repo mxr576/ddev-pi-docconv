@@ -1,15 +1,7 @@
 #ddev-generated
 services:
-  pi-docconv:
-    container_name: ddev-${DDEV_SITENAME}-pi-docconv
-    image: ${PI_DOCCONV_DOCKER_IMAGE:-ddev/ddev-utilities:latest}
-    command: ["sh", "-c", "trap exit TERM; sleep infinity & wait"]
-    restart: "no"
-    # These labels ensure this service is discoverable by DDEV.
-    labels:
-      com.ddev.site-name: ${DDEV_SITENAME}
-      com.ddev.approot: ${DDEV_APPROOT}
-
+  pi:
+    environment:
+      - PI_DOCCONV_VERSION=${PI_DOCCONV_VERSION:-main}
     volumes:
-      - ".:/mnt/ddev_config"
-      - "ddev-global-cache:/mnt/ddev-global-cache"
+      - ${DDEV_APPROOT}/.ddev/pi/bin/docconv:/usr/local/bin/docconv:ro

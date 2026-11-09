@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+#ddev-generated
+"""docconv: Document conversion and visual page verification CLI tool.
+
+Deterministically compiles Markdown to DOCX, PDF, and per-page PNG raster images,
+and validates page geometry constraints for coding agents and developers.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def natural_sort_key(s: Path) -> list:
+    """Sort paths naturally by numerical components."""
+    return [
+        int(text) if text.isdigit() else text.lower()
+        for text in re.split(r"(\d+)", s.name)
+    ]
+
+
+def ensure_command_exists(cmd: str) -> None:
+    """Verify that a required external tool binary exists in PATH."""
+    if shutil.which(cmd) is None:
+        raise RuntimeError(
+            f"Required command '{cmd}' is not installed or not found in PATH."
+        )
+
+
+def run_command(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+    """Execute subprocess capturing output and handling errors."""
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError as e:
+        err_msg = (e.stderr or e.stdout or "").strip()
+        cmd_str = " ".join(cmd)
+        raise RuntimeError(
+            f"Command failed (exit code {e.returncode}): {cmd_str}\n{err_msg}"
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        cmd_str = " ".join(cmd)
+        raise RuntimeError(f"Command timed out after {timeout} seconds: {cmd_str}") from e
+
+
+def get_pdf_page_count(pdf_path: Path) -> int:
+    """Extract page count from a PDF file using pdfinfo."""
+    ensure_command_exists("pdfinfo")
+    res = run_command(["pdfinfo", str(pdf_path.resolve())], timeout=30)
+    match = re.search(r"^Pages:\s+(\d+)", res.stdout, re.MULTILINE)
+    if not match:
+        raise RuntimeError(
+            f"Could not determine page count from pdfinfo for {pdf_path}"
+        )
+    return int(match.group(1))
+
+
+def compile_md_to_docx(
+    md_path: Path, out_docx: Path, reference_doc: Path | None = None
+) -> Path:
+    """Compile Markdown to DOCX using Pandoc with optional reference-doc."""
+    ensure_command_exists("pandoc")
+    cmd = [
+        "pandoc",
+        "-f",
+        "markdown",
+        "-t",
+        "docx",
+        "-o",
+        str(out_docx.resolve()),
+        str(md_path.resolve()),
+    ]
+    if reference_doc:
+        if not reference_doc.is_file():
+            raise FileNotFoundError(f"Reference doc not found: {reference_doc}")
+        cmd.extend(["--reference-doc", str(reference_doc.resolve())])
+    run_command(cmd, timeout=60)
+    if not out_docx.is_file():
+        raise RuntimeError(f"Pandoc succeeded but expected DOCX missing at {out_docx}")
+    return out_docx.resolve()
+
+
+def compile_docx_to_pdf(docx_path: Path, outdir: Path) -> Path:
+    """Convert DOCX to PDF using headless LibreOffice with an isolated profile."""
+    ensure_command_exists("libreoffice")
+    with tempfile.TemporaryDirectory(prefix="lo_profile_") as profile_dir:
+        profile_uri = f"file://{Path(profile_dir).resolve()}"
+        cmd = [
+            "libreoffice",
+            "--headless",
+            "--invisible",
+            "--nologo",
+            "--nodefault",
+            "--nofirststartwizard",
+            f"-env:UserInstallation={profile_uri}",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(outdir.resolve()),
+            str(docx_path.resolve()),
+        ]
+        run_command(cmd, timeout=120)
+
+    expected_pdf = outdir / f"{docx_path.stem}.pdf"
+    if not expected_pdf.is_file():
+        raise RuntimeError(
+            f"LibreOffice succeeded but expected PDF missing at {expected_pdf}"
+        )
+    return expected_pdf.resolve()
+
+
+def render_pdf_to_images(
+    pdf_path: Path, outdir: Path, stem: str, dpi: int = 150
+) -> list[str]:
+    """Render PDF pages to PNG raster images using pdftoppm."""
+    ensure_command_exists("pdftoppm")
+    # Clean up any preexisting images with this pattern
+    for old_img in outdir.glob(f"{stem}-page-*.png"):
+        try:
+            old_img.unlink()
+        except OSError:
+            pass
+
+    prefix = outdir / f"{stem}-page"
+    cmd = [
+        "pdftoppm",
+        "-png",
+        "-r",
+        str(dpi),
+        str(pdf_path.resolve()),
+        str(prefix),
+    ]
+    run_command(cmd, timeout=120)
+
+    images = sorted(outdir.glob(f"{stem}-page-*.png"), key=natural_sort_key)
+    return [str(p.resolve()) for p in images]
+
+
+def handle_convert(args: argparse.Namespace) -> tuple[dict, int]:
+    """Execute docconv convert command."""
+    input_path = Path(args.input).resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    ext = input_path.suffix.lower()
+    if ext not in {".md", ".markdown", ".docx", ".pdf"}:
+        raise ValueError(
+            f"Unsupported input file extension '{ext}'. Supported: .md, .markdown, .docx, .pdf"
+        )
+
+    outdir = Path(args.outdir).resolve() if args.outdir else input_path.parent
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    ref_doc = Path(args.reference_doc).resolve() if args.reference_doc else None
+    if ref_doc and not ref_doc.is_file():
+        raise FileNotFoundError(f"Reference document not found: {ref_doc}")
+
+    to_parts = [p.strip().lower() for p in args.to.split(",") if p.strip()]
+    invalid_formats = set(to_parts) - {"docx", "pdf", "png"}
+    if invalid_formats:
+        raise ValueError(
+            f"Invalid target format(s): {', '.join(invalid_formats)}. Supported: docx, pdf, png"
+        )
+    to_formats = set(to_parts)
+
+    stem = input_path.stem
+    docx_artifact = None
+    pdf_artifact = None
+    image_artifacts = []
+    pages = None
+
+    if ext in {".md", ".markdown"}:
+        # Determine if DOCX is needed
+        needs_docx = "docx" in to_formats
+        needs_pdf = "pdf" in to_formats or "png" in to_formats
+
+        if needs_docx:
+            out_docx = outdir / f"{stem}.docx"
+            compile_md_to_docx(input_path, out_docx, ref_doc)
+            docx_artifact = str(out_docx.resolve())
+            source_docx = out_docx
+        elif needs_pdf:
+            # Temporary DOCX just to feed LibreOffice
+            temp_dir = tempfile.mkdtemp(prefix="docconv_md_")
+            try:
+                temp_docx = Path(temp_dir) / f"{stem}.docx"
+                compile_md_to_docx(input_path, temp_docx, ref_doc)
+                source_docx = temp_docx
+            except Exception:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise
+        else:
+            source_docx = None
+
+        if needs_pdf and source_docx:
+            try:
+                out_pdf = compile_docx_to_pdf(source_docx, outdir)
+            finally:
+                if not needs_docx and "temp_dir" in locals():
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+
+            if "pdf" in to_formats:
+                pdf_artifact = str(out_pdf.resolve())
+            pages = get_pdf_page_count(out_pdf)
+
+            if "png" in to_formats:
+                image_artifacts = render_pdf_to_images(
+                    out_pdf, outdir, stem, dpi=args.dpi
+                )
+
+    elif ext == ".docx":
+        if "docx" in to_formats:
+            if input_path.parent != outdir:
+                dest_docx = outdir / input_path.name
+                shutil.copy2(input_path, dest_docx)
+                docx_artifact = str(dest_docx.resolve())
+            else:
+                docx_artifact = str(input_path.resolve())
+
+        if "pdf" in to_formats or "png" in to_formats:
+            out_pdf = compile_docx_to_pdf(input_path, outdir)
+            if "pdf" in to_formats:
+                pdf_artifact = str(out_pdf.resolve())
+            pages = get_pdf_page_count(out_pdf)
+            if "png" in to_formats:
+                image_artifacts = render_pdf_to_images(
+                    out_pdf, outdir, stem, dpi=args.dpi
+                )
+
+    elif ext == ".pdf":
+        docx_artifact = None
+        if "pdf" in to_formats:
+            if input_path.parent != outdir:
+                dest_pdf = outdir / input_path.name
+                shutil.copy2(input_path, dest_pdf)
+                pdf_artifact = str(dest_pdf.resolve())
+            else:
+                pdf_artifact = str(input_path.resolve())
+            pdf_source = Path(pdf_artifact)
+        else:
+            pdf_source = input_path
+
+        pages = get_pdf_page_count(pdf_source)
+        if "png" in to_formats:
+            image_artifacts = render_pdf_to_images(
+                pdf_source, outdir, stem, dpi=args.dpi
+            )
+
+    payload = {
+        "status": "success",
+        "pages": pages,
+        "target_pages": {
+            "exact": None,
+            "min": None,
+            "max": None,
+        },
+        "artifacts": {
+            "docx": docx_artifact,
+            "pdf": pdf_artifact,
+            "images": image_artifacts,
+        },
+        "errors": [],
+    }
+    return payload, 0
+
+
+def handle_verify(args: argparse.Namespace) -> tuple[dict, int]:
+    """Execute docconv verify command."""
+    input_path = Path(args.input).resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    ext = input_path.suffix.lower()
+    if ext not in {".md", ".markdown", ".docx", ".pdf"}:
+        raise ValueError(
+            f"Unsupported input file extension '{ext}'. Supported: .md, .markdown, .docx, .pdf"
+        )
+
+    outdir = Path(args.outdir).resolve() if args.outdir else input_path.parent
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    ref_doc = Path(args.reference_doc).resolve() if args.reference_doc else None
+    if ref_doc and not ref_doc.is_file():
+        raise FileNotFoundError(f"Reference document not found: {ref_doc}")
+
+    stem = input_path.stem
+    docx_artifact = None
+    pdf_artifact = None
+    image_artifacts = []
+
+    if ext in {".md", ".markdown"}:
+        out_docx = outdir / f"{stem}.docx"
+        compile_md_to_docx(input_path, out_docx, ref_doc)
+        docx_artifact = str(out_docx.resolve())
+
+        out_pdf = compile_docx_to_pdf(out_docx, outdir)
+        pdf_artifact = str(out_pdf.resolve())
+        pdf_source = out_pdf
+
+    elif ext == ".docx":
+        if input_path.parent != outdir:
+            dest_docx = outdir / input_path.name
+            shutil.copy2(input_path, dest_docx)
+            docx_artifact = str(dest_docx.resolve())
+        else:
+            docx_artifact = str(input_path.resolve())
+
+        out_pdf = compile_docx_to_pdf(input_path, outdir)
+        pdf_artifact = str(out_pdf.resolve())
+        pdf_source = out_pdf
+
+    elif ext == ".pdf":
+        docx_artifact = None
+        if input_path.parent != outdir:
+            dest_pdf = outdir / input_path.name
+            shutil.copy2(input_path, dest_pdf)
+            pdf_artifact = str(dest_pdf.resolve())
+        else:
+            pdf_artifact = str(input_path.resolve())
+        pdf_source = Path(pdf_artifact)
+
+    pages = get_pdf_page_count(pdf_source)
+
+    if args.to_png:
+        image_artifacts = render_pdf_to_images(
+            pdf_source, outdir, stem, dpi=args.dpi
+        )
+
+    errors = []
+    target_pages = {
+        "exact": args.exact_pages,
+        "min": args.min_pages,
+        "max": args.max_pages,
+    }
+
+    if args.exact_pages is not None and pages != args.exact_pages:
+        errors.append(
+            f"Document has {pages} page(s), expected exactly {args.exact_pages}."
+        )
+    if args.min_pages is not None and pages < args.min_pages:
+        errors.append(
+            f"Document has {pages} page(s), expected at least {args.min_pages}."
+        )
+    if args.max_pages is not None and pages > args.max_pages:
+        errors.append(
+            f"Document has {pages} page(s), expected at most {args.max_pages}."
+        )
+
+    status = "failed" if errors else "success"
+    exit_code = 1 if errors else 0
+
+    payload = {
+        "status": status,
+        "pages": pages,
+        "target_pages": target_pages,
+        "artifacts": {
+            "docx": docx_artifact,
+            "pdf": pdf_artifact,
+            "images": image_artifacts,
+        },
+        "errors": errors,
+    }
+    return payload, exit_code
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="docconv",
+        description="Deterministic document conversion and visual page verification tool.",
+    )
+    parser.add_argument("--version", action="version", version="docconv 1.0.0")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Subcommand: convert
+    convert_parser = subparsers.add_parser(
+        "convert",
+        help="Convert Markdown/DOCX/PDF to DOCX, PDF, and per-page PNG images.",
+    )
+    convert_parser.add_argument(
+        "input", help="Path to input document (.md, .markdown, .docx, .pdf)"
+    )
+    convert_parser.add_argument(
+        "--reference-doc",
+        help="Path to custom DOCX reference template for Pandoc styling",
+    )
+    convert_parser.add_argument(
+        "--to",
+        default="docx,pdf,png",
+        help="Comma-separated target formats: docx,pdf,png (default: docx,pdf,png)",
+    )
+    convert_parser.add_argument(
+        "--dpi",
+        type=int,
+        default=150,
+        help="DPI resolution for rendered PNG images (default: 150)",
+    )
+    convert_parser.add_argument(
+        "--outdir", help="Output directory for generated artifacts"
+    )
+    convert_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output structured JSON payload conforming to schema",
+    )
+
+    # Subcommand: verify
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Verify document page budget constraints (exact, min, max).",
+    )
+    verify_parser.add_argument(
+        "input", help="Path to input document (.md, .markdown, .docx, .pdf)"
+    )
+    verify_parser.add_argument(
+        "--reference-doc",
+        help="Path to custom DOCX reference template for Pandoc styling",
+    )
+    verify_parser.add_argument(
+        "--exact-pages", type=int, help="Target exact page count"
+    )
+    verify_parser.add_argument(
+        "--min-pages", type=int, help="Target minimum page count"
+    )
+    verify_parser.add_argument(
+        "--max-pages", type=int, help="Target maximum page count"
+    )
+    verify_parser.add_argument(
+        "--to-png",
+        action="store_true",
+        help="Also render PDF to per-page PNG raster images",
+    )
+    verify_parser.add_argument(
+        "--dpi",
+        type=int,
+        default=150,
+        help="DPI resolution for rendered PNG images (default: 150)",
+    )
+    verify_parser.add_argument(
+        "--outdir", help="Output directory for generated artifacts"
+    )
+    verify_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output structured JSON payload conforming to schema",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        if args.command == "convert":
+            payload, exit_code = handle_convert(args)
+        elif args.command == "verify":
+            payload, exit_code = handle_verify(args)
+        else:
+            parser.print_help(sys.stderr)
+            sys.exit(2)
+
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            if payload["status"] == "success":
+                pages_str = f" ({payload['pages']} pages)" if payload["pages"] is not None else ""
+                print(f"[{args.command.upper()}] Success{pages_str}")
+                for art_type, art_val in payload["artifacts"].items():
+                    if isinstance(art_val, list):
+                        for img in art_val:
+                            print(f"  image: {img}")
+                    elif art_val:
+                        print(f"  {art_type}: {art_val}")
+            else:
+                print(f"[{args.command.upper()}] Failed:", file=sys.stderr)
+                for err in payload["errors"]:
+                    print(f"  - {err}", file=sys.stderr)
+
+        sys.exit(exit_code)
+
+    except Exception as e:
+        if getattr(args, "json", False):
+            target_pages = {
+                "exact": getattr(args, "exact_pages", None),
+                "min": getattr(args, "min_pages", None),
+                "max": getattr(args, "max_pages", None),
+            }
+            err_payload = {
+                "status": "failed",
+                "pages": None,
+                "target_pages": target_pages,
+                "artifacts": {
+                    "docx": None,
+                    "pdf": None,
+                    "images": [],
+                },
+                "errors": [str(e)],
+            }
+            print(json.dumps(err_payload, indent=2))
+        else:
+            print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

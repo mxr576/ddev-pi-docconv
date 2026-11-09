@@ -7,7 +7,9 @@
 
 ## Overview
 
-This add-on integrates Pi Docconv into your [DDEV](https://ddev.com/) project.
+This add-on enhances the PI Coding Agent inside the [`ddev-pi`](https://github.com/mxr576/ddev-pi) DDEV add-on with deterministic document conversion and visual page verification capabilities.
+
+It provisions Pandoc, headless LibreOffice, Poppler utilities, and drop-in Microsoft metric-compatible fonts (Carlito for Calibri, Caladea for Cambria, Liberation for Arial/Times/Courier) at image build time, delivering a sandboxed CLI tool (`docconv`) accessible inside the Pi sidecar container and from the host via `ddev docconv`.
 
 ## Installation
 
@@ -20,28 +22,74 @@ After installation, make sure to commit the `.ddev` directory to version control
 
 ## Usage
 
+You can invoke `docconv` from your host terminal or within the `pi` container:
+
 | Command | Description |
 | ------- | ----------- |
-| `ddev describe` | View service status and used ports for Pi Docconv |
-| `ddev logs -s pi-docconv` | Check Pi Docconv logs |
+| `ddev docconv --help` | Display CLI usage information and options |
+| `ddev docconv convert <file>` | Convert Markdown/DOCX to DOCX, PDF, and per-page PNG images |
+| `ddev docconv verify <file> --exact-pages <n>` | Verify that a document meets an exact page count budget |
+| `ddev docconv verify <file> --min-pages <n> --max-pages <m>` | Validate page boundary limits |
 
-## Advanced Customization
+### Examples
 
-To change the Docker image:
-
+#### Convert Markdown to Word, PDF, and PNG Images
 ```bash
-ddev dotenv set .ddev/.env.pi-docconv --pi-docconv-docker-image="ddev/ddev-utilities:latest"
-ddev add-on get mxr576/ddev-pi-docconv
-ddev restart
+ddev docconv convert document.md --to docx,pdf,png
 ```
 
-Make sure to commit the `.ddev/.env.pi-docconv` file to version control.
+#### Compile with a Custom Word Template
+```bash
+ddev docconv convert document.md --reference-doc custom-template.docx
+```
 
-All customization options (use with caution):
+#### Verify 2-Page Budget with JSON Output for Agents
+```bash
+ddev docconv verify CV.md --exact-pages 2 --to-png --json
+```
 
-| Variable | Flag | Default |
-| -------- | ---- | ------- |
-| `PI_DOCCONV_DOCKER_IMAGE` | `--pi-docconv-docker-image` | `ddev/ddev-utilities:latest` |
+Output:
+```json
+{
+  "status": "success",
+  "pages": 2,
+  "target_pages": {
+    "exact": 2,
+    "min": null,
+    "max": null
+  },
+  "artifacts": {
+    "docx": "/var/www/html/CV.docx",
+    "pdf": "/var/www/html/CV.pdf",
+    "images": [
+      "/var/www/html/CV-page-1.png",
+      "/var/www/html/CV-page-2.png"
+    ]
+  },
+  "errors": []
+}
+```
+
+## Customization
+
+The default version tag is defined in `docker-compose.pi-docconv.yaml` via `${PI_DOCCONV_VERSION:-main}`.
+
+To override this version locally on your machine without altering tracked repository files:
+
+1. Add the variable to `.ddev/.env.pi`:
+   ```ini
+   PI_DOCCONV_VERSION="custom-override"
+   ```
+2. Restart the project:
+   ```bash
+   ddev restart
+   ```
+
+All customization options:
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `PI_DOCCONV_VERSION` | `main` | Version / git ref of Pi Docconv |
 
 ## Credits
 

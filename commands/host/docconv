@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#ddev-generated
+## Description: Convert documents (Markdown to DOCX/PDF/PNG) and verify page geometry
+## Usage: docconv [command] [flags]
+## Example: ddev docconv convert input.md --to docx,pdf,png
+set -euo pipefail
+
+if [ -n "${DDEV_APPROOT:-}" ] && [ "$PWD" != "$DDEV_APPROOT" ]; then
+  rel_dir="${PWD#"${DDEV_APPROOT}"/}"
+  if [ "$rel_dir" != "$PWD" ]; then
+    container_dir="/var/www/html/$rel_dir"
+    ddev exec -s pi -d "$container_dir" docconv "$@"
+    exit $?
+  fi
+fi
+
+ddev exec -s pi docconv "$@"
